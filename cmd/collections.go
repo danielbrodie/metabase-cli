@@ -165,7 +165,7 @@ func init() {
 	collCmd.AddCommand(collTreeCmd, collGetCmd, collItemsCmd, collCreateCmd, collUpdateCmd, collArchiveCmd)
 
 	collTreeCmd.Flags().String("search", "", "Filter by name")
-	collTreeCmd.Flags().Int("L", 1, "Max depth")
+	collTreeCmd.Flags().IntP("L", "L", 1, "Max depth")
 	collTreeCmd.Flags().Bool("include-archived", false, "Include archived")
 
 	collItemsCmd.Flags().String("models", "", "Filter by model type")
