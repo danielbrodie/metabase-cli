@@ -1,0 +1,592 @@
+#!/usr/bin/env python3
+"""
+metabase — CLI for Metabase API operations.
+
+Usage: metabase <group> <command> [args] [flags]
+
+Groups: auth, search, resolve, databases, collections, cards, dashboards
+"""
+
+import argparse
+import json
+import os
+import sys
+import re
+import tempfile
+from datetime import datetime
+from pathlib import Path
+
+# ── Config ────────────────────────────────────────────────────────────────────
+
+CONFIG_DIR = Path.home() / ".config" / "metabase"
+CONFIG_FILE = CONFIG_DIR / "config.json"
+
+DEFAULT_CONFIG = {
+    "profiles": {
+        "default": {
+            "url": "http://localhost:3000",
+        }
+    },
+    "active_profile": "default",
+}
+
+
+def load_config():
+    if CONFIG_FILE.exists():
+        return json.loads(CONFIG_FILE.read_text())
+    return DEFAULT_CONFIG
+
+
+def save_config(cfg):
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    CONFIG_FILE.write_text(json.dumps(cfg, indent=2))
+
+
+def get_profile(cfg, name="default"):
+    return cfg["profiles"].get(name, cfg["profiles"]["default"])
+
+
+# ── HTTP ──────────────────────────────────────────────────────────────────────
+
+def api(method, path, profile, data=None, params=None, silent=False):
+    import urllib.request
+    import urllib.parse
+    import urllib.error
+
+    base = profile["url"].rstrip("/")
+    token = profile.get("token", "")
+
+    url = f"{base}/api{path}"
+    if params:
+        url += "?" + urllib.parse.urlencode({k: v for k, v in params.items() if v is not None})
+
+    body = json.dumps(data).encode() if data else None
+    headers = {"Content-Type": "application/json"}
+    if token:
+        headers["X-Metabase-Session"] = token
+
+    req = urllib.request.Request(url, data=body, headers=headers, method=method.upper())
+    try:
+        with urllib.request.urlopen(req) as resp:
+            return json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        body = e.read().decode()
+        if not silent:
+            try:
+                err = json.loads(body)
+                print(json.dumps({"success": False, "error": {"code": "API_ERROR", "message": err.get("message", body)}}))
+            except Exception:
+                print(json.dumps({"success": False, "error": {"code": "API_ERROR", "message": body}}))
+        sys.exit(1)
+
+
+def out(data, as_json=False):
+    if as_json:
+        print(json.dumps({"success": True, "data": data}, indent=2, default=str))
+    else:
+        print(json.dumps(data, indent=2, default=str))
+
+
+# ── Auth ──────────────────────────────────────────────────────────────────────
+
+def cmd_auth_status(args, profile, cfg):
+    try:
+        result = api("GET", "/user/current", profile)
+        info = {"authenticated": True, "url": profile["url"], "email": result.get("email"), "name": f"{result.get('first_name','')} {result.get('last_name','')}".strip()}
+        out(info, args.json)
+    except SystemExit:
+        out({"authenticated": False, "url": profile.get("url")}, args.json)
+
+def cmd_auth_login(args, profile, cfg):
+    url = args.url or profile.get("url") or input("Metabase URL: ").strip()
+    email = args.email or input("Email: ").strip()
+    password = args.password or __import__("getpass").getpass("Password: ")
+
+    profile["url"] = url.rstrip("/")
+    result = api("POST", "/session", profile, data={"username": email, "password": password})
+    token = result["id"]
+    profile["token"] = token
+
+    profile_name = args.profile or cfg.get("active_profile", "default")
+    cfg["profiles"][profile_name] = profile
+    save_config(cfg)
+    print(f"✓ Logged in as {email} → {url}")
+
+def cmd_auth_token(args, profile, cfg):
+    print(profile.get("token", ""))
+
+def cmd_auth_logout(args, profile, cfg):
+    profile_name = args.profile or cfg.get("active_profile", "default")
+    cfg["profiles"][profile_name].pop("token", None)
+    save_config(cfg)
+    print("Logged out.")
+
+
+# ── Search ────────────────────────────────────────────────────────────────────
+
+def cmd_search(args, profile, cfg):
+    params = {"q": args.query, "limit": args.limit}
+    if args.models:
+        params["models"] = args.models
+    if args.collection_id:
+        params["collection_id"] = args.collection_id
+    if args.database_id:
+        params["filter_items_in_personal_collection"] = "exclude"
+    result = api("GET", "/search", profile, params=params)
+    items = result.get("data", result) if isinstance(result, dict) else result
+    if args.json:
+        out(items, True)
+    else:
+        for item in items:
+            print(f"[{item.get('model','?'):12}] {item.get('id'):>5}  {item.get('name','')}")
+
+
+# ── Databases ─────────────────────────────────────────────────────────────────
+
+def cmd_databases_list(args, profile, cfg):
+    result = api("GET", "/database", profile)
+    items = result.get("data", result) if isinstance(result, dict) else result
+    if args.json:
+        out(items, True)
+    else:
+        for db in items:
+            print(f"  {db['id']:>3}  {db['name']}  ({db.get('engine','?')})")
+
+def cmd_databases_get(args, profile, cfg):
+    params = {}
+    if args.include_tables or args.include_fields:
+        params["include"] = "tables.fields" if args.include_fields else "tables"
+    result = api("GET", f"/database/{args.id}", profile, params=params or None)
+    out(result, args.json)
+
+def cmd_databases_metadata(args, profile, cfg):
+    result = api("GET", f"/database/{args.id}/metadata", profile)
+    out(result, args.json)
+
+def cmd_databases_schemas(args, profile, cfg):
+    result = api("GET", f"/database/{args.id}/schemas", profile)
+    out(result, args.json)
+
+
+# ── Collections ───────────────────────────────────────────────────────────────
+
+def cmd_collections_tree(args, profile, cfg):
+    result = api("GET", "/collection/tree", profile)
+    if args.json:
+        out(result, True)
+    else:
+        def print_tree(items, indent=0):
+            for item in items:
+                name = item.get("name", "")
+                if args.search and args.search.lower() not in name.lower():
+                    continue
+                print("  " * indent + f"[{item['id']:>5}]  {name}")
+                children = item.get("children", [])
+                if children and indent < (args.L or 1) - 1:
+                    print_tree(children, indent + 1)
+        print_tree(result)
+
+def cmd_collections_get(args, profile, cfg):
+    cid = "root" if args.id == "root" else args.id
+    result = api("GET", f"/collection/{cid}", profile)
+    out(result, args.json)
+
+def cmd_collections_items(args, profile, cfg):
+    cid = "root" if args.id == "root" else args.id
+    params = {}
+    if args.models:
+        params["models"] = args.models
+    result = api("GET", f"/collection/{cid}/items", profile, params=params or None)
+    items = result.get("data", result) if isinstance(result, dict) else result
+    if args.json:
+        out(items, True)
+    else:
+        for item in items:
+            model = item.get("model", "?")
+            print(f"  [{model:12}] {item.get('id','?'):>5}  {item.get('name','')}")
+
+def cmd_collections_create(args, profile, cfg):
+    data = {"name": args.name}
+    if args.parent_id:
+        data["parent_id"] = args.parent_id
+    if args.description:
+        data["description"] = args.description
+    result = api("POST", "/collection", profile, data=data)
+    out(result, args.json)
+
+def cmd_collections_update(args, profile, cfg):
+    data = {}
+    if args.name:
+        data["name"] = args.name
+    if args.parent_id:
+        data["parent_id"] = args.parent_id
+    result = api("PUT", f"/collection/{args.id}", profile, data=data)
+    out(result, args.json)
+
+def cmd_collections_archive(args, profile, cfg):
+    result = api("PUT", f"/collection/{args.id}", profile, data={"archived": True})
+    print(f"Archived collection {args.id}")
+
+
+# ── Cards ─────────────────────────────────────────────────────────────────────
+
+def cmd_cards_list(args, profile, cfg):
+    params = {"f": args.filter or "mine"}
+    if args.collection_id:
+        params["collection_id"] = args.collection_id
+    result = api("GET", "/card", profile, params=params)
+    if args.json:
+        out(result, True)
+    else:
+        for card in result:
+            print(f"  {card['id']:>5}  {card.get('display','?'):8}  {card.get('name','')}")
+
+def cmd_cards_get(args, profile, cfg):
+    result = api("GET", f"/card/{args.id}", profile)
+    out(result, args.json)
+
+def cmd_cards_run(args, profile, cfg):
+    data = {"ignore_cache": True}
+    if args.parameters:
+        data["parameters"] = json.loads(args.parameters)
+    result = api("POST", f"/card/{args.id}/query", profile, data=data)
+
+    rows = result.get("data", {}).get("rows", [])
+    cols = result.get("data", {}).get("cols", [])
+    col_names = [c.get("display_name", c.get("name", "?")) for c in cols]
+
+    limit = args.limit or 2000
+    rows = rows[:limit]
+
+    if args.json:
+        out([dict(zip(col_names, row)) for row in rows], True)
+    else:
+        # Save to tmp
+        ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+        tmp = Path(tempfile.gettempdir()) / f"metabase-{ts}"
+        tmp.mkdir()
+        out_file = tmp / f"card-{args.id}.json"
+        out_file.write_text(json.dumps([dict(zip(col_names, row)) for row in rows], indent=2, default=str))
+        print(f"Results ({len(rows)} rows) → {out_file}")
+
+def cmd_cards_import(args, profile, cfg):
+    if args.file == "-":
+        data = json.load(sys.stdin)
+    else:
+        data = json.loads(Path(args.file).read_text())
+
+    if args.collection_id:
+        data["collection_id"] = args.collection_id
+    if args.database_id:
+        if "dataset_query" in data:
+            data["dataset_query"]["database"] = args.database_id
+
+    if args.id:
+        result = api("PUT", f"/card/{args.id}", profile, data=data)
+        print(f"Updated card {args.id}: {result.get('name','')}")
+    else:
+        result = api("POST", "/card", profile, data=data)
+        print(f"Created card {result['id']}: {result.get('name','')}")
+    if args.json:
+        out(result, True)
+
+def cmd_cards_archive(args, profile, cfg):
+    api("PUT", f"/card/{args.id}", profile, data={"archived": True})
+    print(f"Archived card {args.id}")
+
+def cmd_cards_delete(args, profile, cfg):
+    if not args.force:
+        confirm = input(f"Permanently delete card {args.id}? [y/N] ")
+        if confirm.lower() != "y":
+            print("Cancelled.")
+            return
+    api("DELETE", f"/card/{args.id}", profile)
+    print(f"Deleted card {args.id}")
+
+
+# ── Dashboards ────────────────────────────────────────────────────────────────
+
+def cmd_dashboards_list(args, profile, cfg):
+    params = {}
+    if args.collection_id:
+        params["collection_id"] = args.collection_id
+    result = api("GET", "/dashboard", profile, params=params or None)
+    if args.json:
+        out(result, True)
+    else:
+        for d in result:
+            print(f"  {d['id']:>5}  {d.get('name','')}")
+
+def cmd_dashboards_get(args, profile, cfg):
+    result = api("GET", f"/dashboard/{args.id}", profile)
+    if args.include_cards:
+        card_ids = [dc.get("card_id") for dc in result.get("dashcards", []) if dc.get("card_id")]
+        result["_cards"] = {cid: api("GET", f"/card/{cid}", profile, silent=True) for cid in card_ids}
+    out(result, args.json)
+
+def cmd_dashboards_export(args, profile, cfg):
+    dash = api("GET", f"/dashboard/{args.id}", profile)
+    card_ids = [dc.get("card_id") for dc in dash.get("dashcards", []) if dc.get("card_id")]
+    cards = {cid: api("GET", f"/card/{cid}", profile, silent=True) for cid in card_ids}
+
+    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+    tmp = Path(tempfile.gettempdir()) / f"metabase-{ts}"
+    tmp.mkdir()
+
+    dash_file = tmp / f"dashboard-{args.id}.json"
+    dash_file.write_text(json.dumps({"export_version": "1.0", "type": "dashboard", "dashboard": dash}, indent=2, default=str))
+    print(f"Dashboard → {dash_file}")
+
+    for cid, card in cards.items():
+        if card:
+            cf = tmp / f"card-{cid}.json"
+            cf.write_text(json.dumps(card, indent=2, default=str))
+            print(f"Card {cid} → {cf}")
+
+def cmd_dashboards_import(args, profile, cfg):
+    if args.file == "-":
+        data = json.load(sys.stdin)
+    else:
+        data = json.loads(Path(args.file).read_text())
+
+    # Unwrap export envelope if present
+    if "dashboard" in data and "export_version" in data:
+        data = data["dashboard"]
+
+    if args.collection_id:
+        data["collection_id"] = args.collection_id
+
+    if args.id:
+        result = api("PUT", f"/dashboard/{args.id}", profile, data=data)
+        print(f"Updated dashboard {args.id}: {result.get('name','')}")
+    else:
+        result = api("POST", "/dashboard", profile, data=data)
+        print(f"Created dashboard {result['id']}: {result.get('name','')}")
+    if args.json:
+        out(result, True)
+
+def cmd_dashboards_revisions(args, profile, cfg):
+    result = api("GET", f"/revision", profile, params={"entity": "dashboard", "id": args.id})
+    out(result, args.json)
+
+def cmd_dashboards_revert(args, profile, cfg):
+    result = api("POST", "/revision/revert", profile, data={"entity": "dashboard", "id": args.id, "revision_id": args.revision_id})
+    out(result, args.json)
+
+def cmd_dashboards_archive(args, profile, cfg):
+    api("PUT", f"/dashboard/{args.id}", profile, data={"archived": True})
+    print(f"Archived dashboard {args.id}")
+
+def cmd_dashboards_delete(args, profile, cfg):
+    if not args.force:
+        confirm = input(f"Permanently delete dashboard {args.id}? [y/N] ")
+        if confirm.lower() != "y":
+            print("Cancelled.")
+            return
+    api("DELETE", f"/dashboard/{args.id}", profile)
+    print(f"Deleted dashboard {args.id}")
+
+
+# ── Resolve ───────────────────────────────────────────────────────────────────
+
+def cmd_resolve(args, profile, cfg):
+    url = args.url
+    patterns = [
+        (r"/question/(\d+)", "card"),
+        (r"/dashboard/(\d+)", "dashboard"),
+        (r"/collection/(\d+)", "collection"),
+        (r"/browse/databases/(\d+)", "database"),
+    ]
+    for pattern, entity in patterns:
+        m = re.search(pattern, url)
+        if m:
+            eid = m.group(1)
+            result = api("GET", f"/{entity}/{eid}", profile)
+            out({"entity": entity, "id": int(eid), "name": result.get("name",""), "data": result}, args.json)
+            return
+    print(json.dumps({"success": False, "error": {"code": "NOT_FOUND", "message": f"Could not parse URL: {url}"}}))
+    sys.exit(1)
+
+
+# ── CLI wiring ────────────────────────────────────────────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser(prog="metabase", description="Metabase CLI")
+    parser.add_argument("-p", "--profile", default="default")
+    parser.add_argument("-v", "--verbose", action="store_true")
+    parser.add_argument("--json", action="store_true")
+
+    sub = parser.add_subparsers(dest="group")
+
+    # auth
+    auth_p = sub.add_parser("auth")
+    auth_sub = auth_p.add_subparsers(dest="cmd")
+    auth_sub.add_parser("status").add_argument("--json", action="store_true")
+    login_p = auth_sub.add_parser("login")
+    login_p.add_argument("--url"); login_p.add_argument("--email"); login_p.add_argument("--password")
+    login_p.add_argument("--method", default="username_password")
+    auth_sub.add_parser("token")
+    auth_sub.add_parser("logout")
+
+    # search
+    search_p = sub.add_parser("search")
+    search_p.add_argument("query")
+    search_p.add_argument("--models"); search_p.add_argument("--collection-id"); search_p.add_argument("--database-id")
+    search_p.add_argument("--limit", type=int, default=50)
+    search_p.add_argument("--archived", action="store_true")
+    search_p.add_argument("--json", action="store_true")
+
+    # resolve
+    resolve_p = sub.add_parser("resolve")
+    resolve_p.add_argument("url")
+    resolve_p.add_argument("--json", action="store_true")
+
+    # databases
+    db_p = sub.add_parser("databases")
+    db_sub = db_p.add_subparsers(dest="cmd")
+    db_list = db_sub.add_parser("list")
+    db_list.add_argument("--include-tables", action="store_true")
+    db_list.add_argument("--json", action="store_true")
+    db_get = db_sub.add_parser("get")
+    db_get.add_argument("id", type=int)
+    db_get.add_argument("--include-tables", action="store_true")
+    db_get.add_argument("--include-fields", action="store_true")
+    db_get.add_argument("--json", action="store_true")
+    db_meta = db_sub.add_parser("metadata")
+    db_meta.add_argument("id", type=int)
+    db_meta.add_argument("--include-hidden", action="store_true")
+    db_meta.add_argument("--json", action="store_true")
+    db_sch = db_sub.add_parser("schemas")
+    db_sch.add_argument("id", type=int)
+    db_sch.add_argument("--json", action="store_true")
+
+    # collections
+    col_p = sub.add_parser("collections")
+    col_sub = col_p.add_subparsers(dest="cmd")
+    col_tree = col_sub.add_parser("tree")
+    col_tree.add_argument("--search"); col_tree.add_argument("-L", type=int, default=1)
+    col_tree.add_argument("--include-archived", action="store_true")
+    col_tree.add_argument("--json", action="store_true")
+    col_get = col_sub.add_parser("get")
+    col_get.add_argument("id")
+    col_get.add_argument("--json", action="store_true")
+    col_items = col_sub.add_parser("items")
+    col_items.add_argument("id")
+    col_items.add_argument("--models"); col_items.add_argument("--archived", action="store_true")
+    col_items.add_argument("--sort-by"); col_items.add_argument("--sort-dir")
+    col_items.add_argument("--json", action="store_true")
+    col_create = col_sub.add_parser("create")
+    col_create.add_argument("--name", required=True)
+    col_create.add_argument("--parent-id"); col_create.add_argument("--description")
+    col_create.add_argument("--json", action="store_true")
+    col_upd = col_sub.add_parser("update")
+    col_upd.add_argument("id"); col_upd.add_argument("--name"); col_upd.add_argument("--parent-id")
+    col_upd.add_argument("--json", action="store_true")
+    col_arch = col_sub.add_parser("archive")
+    col_arch.add_argument("id")
+
+    # cards
+    card_p = sub.add_parser("cards")
+    card_p.add_argument("--json", action="store_true")
+    card_sub = card_p.add_subparsers(dest="cmd")
+    card_list = card_sub.add_parser("list")
+    card_list.add_argument("--filter"); card_list.add_argument("--collection-id")
+    card_list.add_argument("--database-id"); card_list.add_argument("--json", action="store_true")
+    card_get = card_sub.add_parser("get")
+    card_get.add_argument("id", type=int)
+    card_get.add_argument("--json", action="store_true")
+    card_run = card_sub.add_parser("run")
+    card_run.add_argument("id", type=int)
+    card_run.add_argument("--limit", type=int); card_run.add_argument("--parameters")
+    card_run.add_argument("--json", action="store_true")
+    card_imp = card_sub.add_parser("import")
+    card_imp.add_argument("--file", required=True)
+    card_imp.add_argument("--id", type=int); card_imp.add_argument("--collection-id")
+    card_imp.add_argument("--database-id"); card_imp.add_argument("--json", action="store_true")
+    card_arc = card_sub.add_parser("archive")
+    card_arc.add_argument("id", type=int)
+    card_del = card_sub.add_parser("delete")
+    card_del.add_argument("id", type=int); card_del.add_argument("--force", action="store_true")
+
+    # dashboards
+    dash_p = sub.add_parser("dashboards")
+    dash_p.add_argument("--json", action="store_true")
+    dash_sub = dash_p.add_subparsers(dest="cmd")
+    dash_list = dash_sub.add_parser("list")
+    dash_list.add_argument("--collection-id"); dash_list.add_argument("--json", action="store_true")
+    dash_get = dash_sub.add_parser("get")
+    dash_get.add_argument("id", type=int)
+    dash_get.add_argument("--include-cards", action="store_true")
+    dash_get.add_argument("--json", action="store_true")
+    dash_exp = dash_sub.add_parser("export")
+    dash_exp.add_argument("id", type=int)
+    dash_exp.add_argument("--json", action="store_true")
+    dash_imp = dash_sub.add_parser("import")
+    dash_imp.add_argument("--file", required=True)
+    dash_imp.add_argument("--id", type=int); dash_imp.add_argument("--collection-id")
+    dash_imp.add_argument("--json", action="store_true")
+    dash_rev = dash_sub.add_parser("revisions")
+    dash_rev.add_argument("id", type=int); dash_rev.add_argument("--json", action="store_true")
+    dash_revert = dash_sub.add_parser("revert")
+    dash_revert.add_argument("id", type=int); dash_revert.add_argument("revision_id", type=int)
+    dash_arch = dash_sub.add_parser("archive")
+    dash_arch.add_argument("id", type=int)
+    dash_del = dash_sub.add_parser("delete")
+    dash_del.add_argument("id", type=int); dash_del.add_argument("--force", action="store_true")
+
+    args = parser.parse_args()
+
+    cfg = load_config()
+    profile_name = args.profile or cfg.get("active_profile", "default")
+    profile = get_profile(cfg, profile_name)
+
+    # Ensure json flag exists
+    if not hasattr(args, "json"):
+        args.json = False
+
+    dispatch = {
+        ("auth",        "status"):    cmd_auth_status,
+        ("auth",        "login"):     cmd_auth_login,
+        ("auth",        "token"):     cmd_auth_token,
+        ("auth",        "logout"):    cmd_auth_logout,
+        ("search",      None):        cmd_search,
+        ("resolve",     None):        cmd_resolve,
+        ("databases",   "list"):      cmd_databases_list,
+        ("databases",   "get"):       cmd_databases_get,
+        ("databases",   "metadata"):  cmd_databases_metadata,
+        ("databases",   "schemas"):   cmd_databases_schemas,
+        ("collections", "tree"):      cmd_collections_tree,
+        ("collections", "get"):       cmd_collections_get,
+        ("collections", "items"):     cmd_collections_items,
+        ("collections", "create"):    cmd_collections_create,
+        ("collections", "update"):    cmd_collections_update,
+        ("collections", "archive"):   cmd_collections_archive,
+        ("cards",       "list"):      cmd_cards_list,
+        ("cards",       "get"):       cmd_cards_get,
+        ("cards",       "run"):       cmd_cards_run,
+        ("cards",       "import"):    cmd_cards_import,
+        ("cards",       "archive"):   cmd_cards_archive,
+        ("cards",       "delete"):    cmd_cards_delete,
+        ("dashboards",  "list"):      cmd_dashboards_list,
+        ("dashboards",  "get"):       cmd_dashboards_get,
+        ("dashboards",  "export"):    cmd_dashboards_export,
+        ("dashboards",  "import"):    cmd_dashboards_import,
+        ("dashboards",  "revisions"): cmd_dashboards_revisions,
+        ("dashboards",  "revert"):    cmd_dashboards_revert,
+        ("dashboards",  "archive"):   cmd_dashboards_archive,
+        ("dashboards",  "delete"):    cmd_dashboards_delete,
+    }
+
+    group = args.group
+    cmd = getattr(args, "cmd", None)
+    fn = dispatch.get((group, cmd)) or dispatch.get((group, None))
+
+    if not fn:
+        parser.print_help()
+        sys.exit(1)
+
+    fn(args, profile, cfg)
+
+
+if __name__ == "__main__":
+    main()
