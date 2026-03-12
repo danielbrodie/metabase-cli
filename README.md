@@ -102,9 +102,9 @@ metabase resolve 'http://localhost:3000/question/42'
 | `--json` | JSON output |
 | `-v`, `--verbose` | Verbose output |
 
-## OpenClaw Skill
+## Agent Skill
 
-An [OpenClaw](https://openclaw.ai) skill is included in `skill/`. Install it into your skills directory to use `metabase` commands from your agent.
+A `SKILL.md` is included in `skill/` for use with AI coding agents that support skill-based tool discovery. Drop it into your agent's skills directory to enable natural language access to `metabase` commands.
 
 ## License
 
